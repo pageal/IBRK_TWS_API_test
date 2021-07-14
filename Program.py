@@ -11,11 +11,14 @@ import inspect
 import logging
 import time
 import os.path
+from threading import Thread
 
 from ibapi import wrapper
 from ibapi import utils
 from ibapi.client import EClient
-from ibapi.utils import iswrapper
+from ibapi.utils import *
+import logging
+import queue
 
 # types
 from ibapi.common import * # @UnusedWildImport
@@ -30,35 +33,17 @@ from ibapi.ticktype import * # @UnusedWildImport
 from ibapi.tag_value import TagValue
 
 from ibapi.account_summary_tags import *
+from ibapi.scanner import ScanData
 
+import sys
+sys.path.append("{}\\TWS API\\samples\\Python\\Testbed".format(os.path.dirname(os.path.realpath(__file__))))
 from ContractSamples import ContractSamples
 from OrderSamples import OrderSamples
 from AvailableAlgoParams import AvailableAlgoParams
 from ScannerSubscriptionSamples import ScannerSubscriptionSamples
 from FaAllocationSamples import FaAllocationSamples
-from ibapi.scanner import ScanData
 
 
-def SetupLogger():
-    if not os.path.exists("log"):
-        os.makedirs("log")
-
-    time.strftime("pyibapi.%Y%m%d_%H%M%S.log")
-
-    recfmt = '(%(threadName)s) %(asctime)s.%(msecs)03d %(levelname)s %(filename)s:%(lineno)d %(message)s'
-
-    timefmt = '%y%m%d_%H:%M:%S'
-
-    # logging.basicConfig( level=logging.DEBUG,
-    #                    format=recfmt, datefmt=timefmt)
-    logging.basicConfig(filename=time.strftime("log/pyibapi.%y%m%d_%H%M%S.log"),
-                        filemode="w",
-                        level=logging.INFO,
-                        format=recfmt, datefmt=timefmt)
-    logger = logging.getLogger()
-    console = logging.StreamHandler()
-    console.setLevel(logging.ERROR)
-    logger.addHandler(console)
 
 
 def printWhenExecuting(fn):
@@ -94,17 +79,15 @@ class RequestMgr(Object):
         pass
 
 
-# ! [socket_declare]
-class TestClient(EClient):
+class TWSClient(EClient):
     def __init__(self, wrapper):
         EClient.__init__(self, wrapper)
-        # ! [socket_declare]
-
         # how many times a method is called to see test coverage
         self.clntMeth2callCount = collections.defaultdict(int)
         self.clntMeth2reqIdIdx = collections.defaultdict(lambda: -1)
         self.reqId2nReq = collections.defaultdict(int)
         self.setupDetectReqId()
+        self.stop_message_loop = False
 
     def countReqId(self, methName, fn):
         def countReqId_(*args, **kwargs):
@@ -118,7 +101,6 @@ class TestClient(EClient):
         return countReqId_
 
     def setupDetectReqId(self):
-
         methods = inspect.getmembers(EClient, inspect.isfunction)
         for (methName, meth) in methods:
             if methName != "send_msg":
@@ -131,14 +113,50 @@ class TestClient(EClient):
                     if paramName == "reqId":
                         self.clntMeth2reqIdIdx[methName] = idx
 
-                setattr(TestClient, methName, self.countReqId(methName, meth))
+                setattr(TWSClient, methName, self.countReqId(methName, meth))
 
-                # print("TestClient.clntMeth2reqIdIdx", self.clntMeth2reqIdIdx)
+                # print("TWSClient.clntMeth2reqIdIdx", self.clntMeth2reqIdIdx)
+
+    def run_message_loop(self):
+        """This is the function that has the message loop."""
+        self.stop_message_loop = False
+        try:
+            while (self.isConnected() or not self.msg_queue.empty()) and not self.stop_message_loop:
+                try:
+                    try:
+                        text = self.msg_queue.get(block=True, timeout=0.2)
+                        if len(text) > MAX_MSG_LEN:
+                            self.wrapper.error(NO_VALID_ID, BAD_LENGTH.code(),
+                                "%s:%d:%s" % (BAD_LENGTH.msg(), len(text), text))
+                            break
+                    except queue.Empty:
+                        logger.debug("queue.get: empty")
+                        self.msgLoopTmo()
+                    else:
+                        fields = comm.read_fields(text)
+                        logger.debug("fields %s", fields)
+                        self.decoder.interpret(fields)
+                        self.msgLoopRec()
+                except (KeyboardInterrupt, SystemExit):
+                    logger.info("detected KeyboardInterrupt, SystemExit")
+                    self.keyboardInterrupt()
+                    self.keyboardInterruptHard()
+                except BadMessage:
+                    logger.info("BadMessage")
+
+                logger.debug("conn:%d queue.sz:%d",
+                             self.isConnected(),
+                             self.msg_queue.qsize())
+        finally:
+            self.disconnect()
+
+    def run_message_loop_thread(self):
+        """This is the function that has the message loop running in separate thread"""
+        self.message_loop_thread = Thread(target=self.run_message_loop)
+        self.message_loop_thread.start()
 
 
-# ! [ewrapperimpl]
-class TestWrapper(wrapper.EWrapper):
-    # ! [ewrapperimpl]
+class TWSWrapper(wrapper.EWrapper):
     def __init__(self):
         wrapper.EWrapper.__init__(self)
 
@@ -146,10 +164,6 @@ class TestWrapper(wrapper.EWrapper):
         self.wrapMeth2reqIdIdx = collections.defaultdict(lambda: -1)
         self.reqId2nAns = collections.defaultdict(int)
         self.setupDetectWrapperReqId()
-
-    # TODO: see how to factor this out !!
-
-
 
     def countWrapReqId(self, methName, fn):
         def countWrapReqId_(*args, **kwargs):
@@ -162,7 +176,6 @@ class TestWrapper(wrapper.EWrapper):
         return countWrapReqId_
 
     def setupDetectWrapperReqId(self):
-
         methods = inspect.getmembers(wrapper.EWrapper, inspect.isfunction)
         for (methName, meth) in methods:
             self.wrapMeth2callCount[methName] = 0
@@ -174,33 +187,59 @@ class TestWrapper(wrapper.EWrapper):
                 if 'error' not in methName and paramName == "reqId":
                     self.wrapMeth2reqIdIdx[methName] = idx
 
-            setattr(TestWrapper, methName, self.countWrapReqId(methName, meth))
+            setattr(TWSWrapper, methName, self.countWrapReqId(methName, meth))
 
-            # print("TestClient.wrapMeth2reqIdIdx", self.wrapMeth2reqIdIdx)
+            # print("TWSClient.wrapMeth2reqIdIdx", self.wrapMeth2reqIdIdx)
 
+class TWS_agent(TWSWrapper, TWSClient):
+    def __init__(self, log_level=logging.INFO):
+        TWSWrapper.__init__(self)
+        TWSClient.__init__(self, wrapper=self)
 
-# this is here for documentation generation
-"""
-#! [ereader]
-        # You don't need to run this in your code!
-        self.reader = reader.EReader(self.conn, self.msg_queue)
-        self.reader.start()   # start thread
-#! [ereader]
-"""
-
-# ! [socket_init]
-class TestApp(TestWrapper, TestClient):
-    def __init__(self):
-        TestWrapper.__init__(self)
-        TestClient.__init__(self, wrapper=self)
-        # ! [socket_init]
-        self.nKeybInt = 0
         self.started = False
         self.nextValidOrderId = None
         self.permId2ord = {}
         self.reqId2nErr = collections.defaultdict(int)
-        self.globalCancelOnly = False
         self.last_order_id = None
+
+        self.SetupLogger(log_level)
+
+    def SetupLogger(self, log_level=logging.INFO):
+        if not os.path.exists("log"):
+            os.makedirs("log")
+
+        time.strftime("pyibapi.%Y%m%d_%H%M%S.log")
+
+        recfmt = '(%(threadName)s) %(asctime)s.%(msecs)03d %(levelname)s %(filename)s:%(lineno)d %(message)s'
+
+        timefmt = '%y%m%d_%H:%M:%S'
+
+        # logging.basicConfig( level=logging.DEBUG,
+        #                    format=recfmt, datefmt=timefmt)
+        logging.basicConfig(filename=time.strftime("log/pyibapi.%y%m%d_%H%M%S.log"),
+                            filemode="w",
+                            level=log_level,
+                            format=recfmt, datefmt=timefmt)
+        logger = logging.getLogger()
+        console = logging.StreamHandler()
+        console.setLevel(log_level)
+        logger.addHandler(console)
+
+        logging.debug("now is %s", datetime.datetime.now())
+        logging.getLogger().setLevel(log_level)
+
+        # enable logging when member vars are assigned
+        from ibapi import utils
+        Order.__setattr__ = utils.setattr_log
+        Contract.__setattr__ = utils.setattr_log
+        DeltaNeutralContract.__setattr__ = utils.setattr_log
+        TagValue.__setattr__ = utils.setattr_log
+        TimeCondition.__setattr__ = utils.setattr_log
+        ExecutionCondition.__setattr__ = utils.setattr_log
+        MarginCondition.__setattr__ = utils.setattr_log
+        PriceCondition.__setattr__ = utils.setattr_log
+        PercentChangeCondition.__setattr__ = utils.setattr_log
+        VolumeCondition.__setattr__ = utils.setattr_log
 
     def dumpTestCoverageSituation(self):
         for clntMeth in sorted(self.clntMeth2callCount.keys()):
@@ -240,8 +279,8 @@ class TestApp(TestWrapper, TestClient):
         oid = self.nextValidOrderId
         try:
             self.nextValidOrderId += 1
-        except Execution as e:
-            print(e)
+        except Exception as e:
+            pass
         return oid
 
     @iswrapper
@@ -262,10 +301,10 @@ class TestApp(TestWrapper, TestClient):
     def openOrder(self, orderId: OrderId, contract: Contract, order: Order,
                   orderState: OrderState):
         super().openOrder(orderId, contract, order, orderState)
-        print("OpenOrder. PermId: ", order.permId, "ClientId:", order.clientId, " OrderId:", orderId, 
+        print("OpenOrder. PermId: ", order.permId, "ClientId:", order.clientId, " OrderId:", orderId,
               "Account:", order.account, "Symbol:", contract.symbol, "SecType:", contract.secType,
               "Exchange:", contract.exchange, "Action:", order.action, "OrderType:", order.orderType,
-              "TotalQty:", order.totalQuantity, "CashQty:", order.cashQty, 
+              "TotalQty:", order.totalQuantity, "CashQty:", order.cashQty,
               "LmtPrice:", order.lmtPrice, "AuxPrice:", order.auxPrice, "Status:", orderState.status)
 
         order.contract = contract
@@ -572,7 +611,7 @@ class TestApp(TestWrapper, TestClient):
     @printWhenExecuting
     def tickDataOperations_req(self):
         self.reqMarketDataType(MarketDataTypeEnum.DELAYED_FROZEN)
-        
+
         # Requesting real time market data
 
         # ! [reqmktdata]
@@ -614,7 +653,7 @@ class TestApp(TestWrapper, TestClient):
         # Requesting data for an option contract will return the greek values
         self.reqMktData(1013, ContractSamples.OptionWithLocalSymbol(), "", False, False, [])
         self.reqMktData(1014, ContractSamples.FuturesOnOptions(), "", False, False, []);
-        
+
         # ! [reqoptiondatagenticks]
 
         # ! [reqfuturesopeninterest]
@@ -628,12 +667,12 @@ class TestApp(TestWrapper, TestClient):
         # ! [reqavgoptvolume]
         self.reqMktData(1017, ContractSamples.USStockAtSmart(), "mdoff,105", False, False, [])
         # ! [reqavgoptvolume]
-        
+
         # ! [reqsmartcomponents]
         # Requests description of map of single letter exchange codes to full exchange names
         self.reqSmartComponents(1018, "a6")
         # ! [reqsmartcomponents]
-        
+
 
     @printWhenExecuting
     def tickDataOperations_cancel(self):
@@ -644,24 +683,24 @@ class TestApp(TestWrapper, TestClient):
         # ! [cancelmktdata]
 
         self.cancelMktData(1004)
-        
+
         self.cancelMktData(1005)
         self.cancelMktData(1006)
         self.cancelMktData(1007)
         self.cancelMktData(1008)
-        
+
         self.cancelMktData(1009)
         self.cancelMktData(1010)
         self.cancelMktData(1011)
         self.cancelMktData(1012)
-        
+
         self.cancelMktData(1013)
         self.cancelMktData(1014)
-        
+
         self.cancelMktData(1015)
-        
+
         self.cancelMktData(1016)
-        
+
         self.cancelMktData(1017)
 
     @iswrapper
@@ -755,7 +794,7 @@ class TestApp(TestWrapper, TestClient):
         self.cancelTickByTickData(19007)
         self.cancelTickByTickData(19008)
         # ! [canceltickbytickwithhist]
-        
+
     @iswrapper
     # ! [orderbound]
     def orderBound(self, orderId: int, apiClientId: int, apiOrderId: int):
@@ -905,7 +944,7 @@ class TestApp(TestWrapper, TestClient):
         # ! [cancelHeadTimestamp]
         self.cancelHeadTimeStamp(4101)
         # ! [cancelHeadTimestamp]
-        
+
         # Canceling historical data requests
         # ! [cancelhistoricaldata]
         self.cancelHistoricalData(4102)
@@ -1198,7 +1237,7 @@ class TestApp(TestWrapper, TestClient):
         # ! [reqcomplexscanner]
         AAPLConIDTag = [TagValue("underConID", "265598")]
         self.reqScannerSubscription(7003, ScannerSubscriptionSamples.ComplexOrdersAndTrades(), [], AAPLConIDTag) # requires TWS v975+
-        
+
         # ! [reqcomplexscanner]
 
 
@@ -1273,7 +1312,7 @@ class TestApp(TestWrapper, TestClient):
         # ! [reqfundamentaldata]
         self.reqFundamentalData(8001, ContractSamples.USStock(), "ReportsFinSummary", [])
         # ! [reqfundamentaldata]
-        
+
         # ! [fundamentalexamples]
         self.reqFundamentalData(8002, ContractSamples.USStock(), "ReportSnapshot", []); # for company overview
         self.reqFundamentalData(8003, ContractSamples.USStock(), "ReportRatios", []); # for financial ratios
@@ -1413,7 +1452,7 @@ class TestApp(TestWrapper, TestClient):
         # ! [place_midprice]
         self.placeOrder(self.nextOrderId(), ContractSamples.USStockAtSmart(), OrderSamples.Midprice("BUY", 1, 150))
         # ! [place_midprice]
-		
+
         # ! [ad]
         # The Time Zone in "startTime" and "endTime" attributes is ignored and always defaulted to GMT
         AvailableAlgoParams.FillAccumulateDistributeParams(baseOrder, 10, 60, True, True, 1, True, True, "20161010-12:00:00 GMT", "20161010-16:00:00 GMT")
@@ -1739,26 +1778,26 @@ class TestApp(TestWrapper, TestClient):
         # Attached TRAIL adjusted can only be attached to LMT parent orders.
         # self.placeOrder(self.nextOrderId(), ContractSamples.EuropeanStock(), OrderSamples.AttachAdjustableToTrailAmount(lmtParent, 34, 32, 33, 0.008))
         self.algoSamples()
-        
+
         self.ocaSample()
 
         # Request the day's executions
         # ! [reqexecutions]
         self.reqExecutions(10001, ExecutionFilter())
         # ! [reqexecutions]
-        
+
         # Requesting completed orders
         # ! [reqcompletedorders]
         self.reqCompletedOrders(False)
         # ! [reqcompletedorders]
-        
+
 
     def orderOperations_cancel(self):
         if self.last_order_id is not None:
             # ! [cancelorder]
             self.cancelOrder(self.last_order_id)
             # ! [cancelorder]
-            
+
         # Cancel all orders for all accounts
         # ! [reqglobalcancel]
         self.reqGlobalCancel()
@@ -1819,10 +1858,10 @@ class TestApp(TestWrapper, TestClient):
     def completedOrder(self, contract: Contract, order: Order,
                   orderState: OrderState):
         super().completedOrder(contract, order, orderState)
-        print("CompletedOrder. PermId:", order.permId, "ParentPermId:", utils.longToStr(order.parentPermId), "Account:", order.account, 
-              "Symbol:", contract.symbol, "SecType:", contract.secType, "Exchange:", contract.exchange, 
-              "Action:", order.action, "OrderType:", order.orderType, "TotalQty:", order.totalQuantity, 
-              "CashQty:", order.cashQty, "FilledQty:", order.filledQuantity, 
+        print("CompletedOrder. PermId:", order.permId, "ParentPermId:", utils.longToStr(order.parentPermId), "Account:", order.account,
+              "Symbol:", contract.symbol, "SecType:", contract.secType, "Exchange:", contract.exchange,
+              "Action:", order.action, "OrderType:", order.orderType, "TotalQty:", order.totalQuantity,
+              "CashQty:", order.cashQty, "FilledQty:", order.filledQuantity,
               "LmtPrice:", order.lmtPrice, "AuxPrice:", order.auxPrice, "Status:", orderState.status,
               "Completed time:", orderState.completedTime, "Completed Status:" + orderState.completedStatus)
     # ! [completedorder]
@@ -1866,7 +1905,8 @@ class TestApp(TestWrapper, TestClient):
             order.orderType = "LMT"
             order.lmtPrice = limit_price
 
-        self.last_order_id = self.nextOrderId()
+        while self.last_order_id == None:
+            self.last_order_id = self.nextOrderId()
         self.placeOrder(self.last_order_id, contract, order)
 
 
@@ -1887,62 +1927,7 @@ class TestApp(TestWrapper, TestClient):
             return
 
         self.started = True
-
-        if self.globalCancelOnly:
-            print("Executing GlobalCancel only")
-            self.reqGlobalCancel()
-        else:
-            print("Executing requests")
-            #self.reqGlobalCancel()
-            #self.marketDataTypeOperations()
-            #self.accountOperations_req()
-            #self.tickDataOperations_req()
-            #self.marketDepthOperations_req()
-            #self.realTimeBarsOperations_req()
-            #self.historicalDataOperations_req()
-            #self.optionsOperations_req()
-
-            #self.fundamentalsOperations_req()
-            #self.bulletinsOperations_req()
-            #self.contractOperations()
-            #self.newsOperations_req()
-            #self.miscelaneousOperations()
-            #self.linkingOperations()
-            #self.financialAdvisorOperations()
-            #self.orderOperations_req()
-            #self.rerouteCFDOperations()
-            #self.marketRuleOperations()
-            #self.pnlOperations_req()
-            #self.histogramOperations_req()
-            #self.continuousFuturesOperations_req()
-            #self.historicalTicksOperations()
-            #self.tickByTickOperations_req()
-            #self.whatIfOrderOperations()
-
-            #################################
-            #pgesyuk tests
-            # NO PERMISSIONS/SUBSCRIPTIONS
-            #self.getMktData("INTC")
-            #self.reqHistoricalDataUS("INTC")
-            #self.marketScannersOperations_req()
-
-            #################################
-            #WORKS
-            self.reqNewBuyOrder("WKLY", quantity=8)
-            self.reqNewBuyOrder("DX", quantity=20)
-            self.reqNewBuyOrder("CHMI", quantity=20)
-            #self.reqOpenOrders()
-            #for order_id,order_inst in self.permId2ord.items():
-            #    self.cancelOrder(order_inst.orderId)
-
-            #cancel last order
-            #if self.last_order_id is not None:
-            #    self.cancelOrder(self.last_order_id)
-
-            # Cancel all orders for all accounts
-            #self.reqGlobalCancel()
-
-            print("Executing requests ... finished")
+        print("INFO: Requests can be executed now")
 
 
     def stop(self):
@@ -1968,73 +1953,29 @@ class TestApp(TestWrapper, TestClient):
         self.stop_message_loop = True
         self.message_loop_thread.join()
 
-def main():
-    SetupLogger()
-    logging.debug("now is %s", datetime.datetime.now())
-    logging.getLogger().setLevel(logging.ERROR)
 
-    cmdLineParser = argparse.ArgumentParser("api tests")
-    # cmdLineParser.add_option("-c", action="store_True", dest="use_cache", default = False, help = "use the cache")
-    # cmdLineParser.add_option("-f", action="store", type="string", dest="file", default="", help="the input file")
-    cmdLineParser.add_argument("-p", "--port", action="store", type=int,
-                               dest="port", default=7497, help="The TCP port to use")
-    cmdLineParser.add_argument("-C", "--global-cancel", action="store_true",
-                               dest="global_cancel", default=False,
-                               help="whether to trigger a globalCancel req")
-    args = cmdLineParser.parse_args()
-    print("Using args", args)
-    logging.debug("Using args %s", args)
-    print(args)
-
-
-    # enable logging when member vars are assigned
-    from ibapi import utils
-    Order.__setattr__ = utils.setattr_log
-    Contract.__setattr__ = utils.setattr_log
-    DeltaNeutralContract.__setattr__ = utils.setattr_log
-    TagValue.__setattr__ = utils.setattr_log
-    TimeCondition.__setattr__ = utils.setattr_log
-    ExecutionCondition.__setattr__ = utils.setattr_log
-    MarginCondition.__setattr__ = utils.setattr_log
-    PriceCondition.__setattr__ = utils.setattr_log
-    PercentChangeCondition.__setattr__ = utils.setattr_log
-    VolumeCondition.__setattr__ = utils.setattr_log
-
-    try:
-        app = TestApp()
-        if args.global_cancel:
-            app.globalCancelOnly = True
-        # ! [connect]
-        app.connect("127.0.0.1", args.port, clientId=0)
-        # ! [connect]
-        print("serverVersion:%s connectionTime:%s" % (app.serverVersion(),
-                                                      app.twsConnectionTime()))
-
-        # ! [clientrun]
-        app.run_message_loop_thread()
-
-        app.reqNewBuyOrder("DX", quantity=1, limit_price=18)
-
-        # app.reqOpenOrders()
-        # for order_id,order_inst in self.permId2ord.items():
-        #    app.cancelOrder(order_inst.orderId)
-
-        # cancel last order
-        if app.last_order_id is not None:
-            app.cancelOrder(app.last_order_id)
-
-        # Cancel all orders for all accounts
-        # app.reqGlobalCancel()
-
-        app.finish()
-        # ! [clientrun]
-    except:
-        raise
-    finally:
-        app.dumpTestCoverageSituation()
-        app.dumpReqAnsErrSituation()
-    print("main completed")
-
-
+#TWS_agent unit test
 if __name__ == "__main__":
-    main()
+    tws_agent = TWS_agent()
+    tws_agent.connect(host="127.0.0.1", port=7497, clientId=0)
+    print("serverVersion:%s connectionTime:%s" % (tws_agent.serverVersion(),
+                                                  tws_agent.twsConnectionTime()))
+
+    tws_agent.run_message_loop_thread()
+    time.sleep(1)
+
+    #tws_agent.reqNewBuyOrder("DX", quantity=1, limit_price=18)
+
+    tws_agent.reqOpenOrders()
+    for order_id,order_inst in self.permId2ord.items():
+       tws_agent.cancelOrder(order_inst.orderId)
+
+    # cancel last order
+    #if tws_agent.last_order_id is not None:
+    #    tws_agent.cancelOrder(tws_agent.last_order_id)
+
+    # Cancel all orders for all accounts
+    # tws_agent.reqGlobalCancel()
+
+    tws_agent.finish()
+    print("main completed")
